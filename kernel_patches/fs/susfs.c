@@ -1816,6 +1816,7 @@ static DEFINE_MUTEX(susfs_mutex_lock_priority_uid_filter);
 static char *susfs_priority_app_strings = NULL;
 /* Ensures that there is only one resolving thread running at the same time */
 static atomic_t susfs_priority_app_strings_running = ATOMIC_INIT(0);
+static bool susfs_priority_uid_filter_all = false;
 
 /*
  * Checks whether the given string is a valid app package name.
@@ -1952,16 +1953,41 @@ static int susfs_resolve_priority_app_uid(const char *app_name, uid_t *uid) {
  * skipped (they are uninstalled already), otherwise an error is returned.
  * Returns 0 on success, a negative errno on failure.
  */
-static int susfs_parse_priority_app_names(char *app_str, unsigned long *bits, bool skip_failed) {
+static int susfs_parse_priority_app_names(char *app_str, unsigned long *bits, bool skip_failed, bool *filter_all) {
 	char *token = NULL;
 	char *saveptr = app_str;
 	uid_t uid = 0;
 	int ret;
 
+	*filter_all = false;
+
 	while ((token = strsep(&saveptr, ",")) != NULL) {
 		token = strim(token);
 		if (*token == '\0') {
 			/* tolerate the empty items, e.g., "com.foo,,com.bar" */
+			continue;
+		}
+
+		/* Blanket wildcard filter */
+		if (!strcmp(token, "all") || !strcmp(token, "*")) {
+			*filter_all = true;
+			SUSFS_LOGI("priority_uid_filter: blanket filter enabled\n");
+			continue;
+		}
+
+		/* Accept raw numeric UIDs */
+		if (kstrtouint(token, 10, &uid) == 0) {
+			uid = uid % 100000;
+			if (uid < SUSFS_UID_FILTER_MIN_UID || uid > SUSFS_UID_FILTER_MAX_UID) {
+				SUSFS_LOGE("uid %u is out of allowed range [%d, %d]\n",
+					uid, SUSFS_UID_FILTER_MIN_UID,
+					SUSFS_UID_FILTER_MAX_UID);
+				if (!skip_failed)
+					return -EINVAL;
+				continue;
+			}
+			set_bit(uid - SUSFS_UID_FILTER_MIN_UID, bits);
+			SUSFS_LOGI("uid '%u' is now added to priority_uid_filter_bitmap\n", uid);
 			continue;
 		}
 
@@ -2001,6 +2027,7 @@ void susfs_set_priority_uid_filter(void __user **user_info) {
 	struct cred *orig_cred = NULL;
 	size_t app_str_len = 0;
 	int err = 0;
+	bool filter_all = false;
 	static bool is_uid_filter_set_before = false;
 
 	info = kvmalloc(sizeof(*info), GFP_KERNEL | __GFP_ZERO);
@@ -2059,7 +2086,7 @@ void susfs_set_priority_uid_filter(void __user **user_info) {
 
 	if (is_uid_filter_set_before)
 		SUSFS_LOGI("renewing the priority uid filter\n");
-	err = susfs_parse_priority_app_names(info->app_strings, new_bitmap->bits, true);
+	err = susfs_parse_priority_app_names(info->app_strings, new_bitmap->bits, true, &filter_all);
 
 	susfs_restore_creds(orig_cred);
 	orig_cred = NULL;
@@ -2074,6 +2101,7 @@ void susfs_set_priority_uid_filter(void __user **user_info) {
 	 * never access a freed bitmap.
 	 */
 	mutex_lock(&susfs_mutex_lock_priority_uid_filter);
+	WRITE_ONCE(susfs_priority_uid_filter_all, filter_all);
 	old_bitmap = rcu_dereference_protected(priority_uid_filter_bitmap, lockdep_is_held(&susfs_mutex_lock_priority_uid_filter));
 	rcu_assign_pointer(priority_uid_filter_bitmap, new_bitmap);
 	new_bitmap = NULL;
@@ -2116,6 +2144,7 @@ static int susfs_priority_app_strings_worker(void *data) {
 	char *app_strings = NULL;
 	size_t app_str_len = 0;
 	int ret = 0;
+	bool filter_all = false;
 
 	/*
 	 * The data paths of the apps cannot be accessed with the selinux
@@ -2144,7 +2173,7 @@ static int susfs_priority_app_strings_worker(void *data) {
 		goto out_restore_creds;
 
 	/* the apps that are uninstalled already are skipped */
-	ret = susfs_parse_priority_app_names(app_strings, new_bitmap->bits, true);
+	ret = susfs_parse_priority_app_names(app_strings, new_bitmap->bits, true, &filter_all);
 	if (ret)
 		goto out_restore_creds;
 
@@ -2153,6 +2182,7 @@ static int susfs_priority_app_strings_worker(void *data) {
 	 * the new one, which is then published to the readers.
 	 */
 	mutex_lock(&susfs_mutex_lock_priority_uid_filter);
+	WRITE_ONCE(susfs_priority_uid_filter_all, filter_all);
 	old_bitmap = rcu_dereference_protected(priority_uid_filter_bitmap, lockdep_is_held(&susfs_mutex_lock_priority_uid_filter));
 	rcu_assign_pointer(priority_uid_filter_bitmap, new_bitmap);
 	new_bitmap = NULL;
@@ -2203,6 +2233,9 @@ bool susfs_is_priority_uid_filtered(uid_t uid) {
 	if (app_id < SUSFS_UID_FILTER_MIN_UID ||
 		app_id > SUSFS_UID_FILTER_MAX_UID)
 		return false;
+
+	if (READ_ONCE(susfs_priority_uid_filter_all))
+		return true;
 
 	/* no need rcu_read_lock() and rcu_read_unlock() here as caller already holds it */
 	bitmap = rcu_dereference(priority_uid_filter_bitmap);
